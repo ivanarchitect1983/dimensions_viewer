@@ -1,4 +1,4 @@
-# 📐 Dimensions Viewer (EN/RU versions)
+# 📐 Dimensions Viewer
 
 A SketchUp extension that displays the **dimensions, area, volume, and perimeter**
 of selected objects in real time.
