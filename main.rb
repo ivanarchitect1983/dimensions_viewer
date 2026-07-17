@@ -1,25 +1,25 @@
+require File.expand_path('rays', __dir__)
+require File.expand_path('intersections', __dir__)
+require File.expand_path('hide_others', __dir__)
+
 module DimViewer
   module Main
 
-    VERSION = 12  # <- меняйте при каждой правке; число видно в углу окна
+    VERSION = 23
 
-    # TODO: заменить на реальный адрес репозитория проекта
     GITHUB_URL = 'https://github.com/ivanarchitect1983/dimensions_viewer'
 
     @dialog = nil
+    @sel_observer = nil
 
-    # Точка -> [x,y,z] чистые Float в дюймах.
     def self.pt_xyz(point3d)
       a = point3d.to_a
       [a[0].to_f, a[1].to_f, a[2].to_f]
     end
 
-    # =====================================================================
-    #  СБОР ТОЧЕК (Float, дюймы)
-    # =====================================================================
-
     def self.collect_points(entity, transform, pts)
       return unless entity && entity.valid?
+
       case entity
       when Sketchup::Group
         t = transform * entity.transformation
@@ -28,14 +28,18 @@ module DimViewer
         t = transform * entity.transformation
         entity.definition.entities.each { |e| collect_points(e, t, pts) }
       when Sketchup::Edge
-        entity.vertices.each { |v| pts << pt_xyz(v.position.transform(transform)) }
+        entity.vertices.each do |v|
+          pts << pt_xyz(v.position.transform(transform))
+        end
       when Sketchup::Face
-        entity.vertices.each { |v| pts << pt_xyz(v.position.transform(transform)) }
+        entity.vertices.each do |v|
+          pts << pt_xyz(v.position.transform(transform))
+        end
       when Sketchup::Vertex
         pts << pt_xyz(entity.position.transform(transform))
       when Sketchup::CLine
         pts << pt_xyz(entity.start.transform(transform)) if entity.start
-        pts << pt_xyz(entity.end.transform(transform))   if entity.end
+        pts << pt_xyz(entity.end.transform(transform)) if entity.end
       end
     rescue => e
       puts "DimViewer collect_points error: #{e.message}"
@@ -43,14 +47,17 @@ module DimViewer
 
     def self.bounds_of(pts)
       return nil if pts.empty?
+
       min = pts[0].dup
       max = pts[0].dup
+
       pts.each do |p|
         3.times do |i|
           min[i] = p[i] if p[i] < min[i]
           max[i] = p[i] if p[i] > max[i]
         end
       end
+
       [min, max]
     end
 
@@ -60,22 +67,17 @@ module DimViewer
       bounds_of(pts)
     end
 
-    # =====================================================================
-    #  ЛОКАЛЬНЫЕ ГАБАРИТЫ — чистая разница координат внутренней геометрии.
-    #  Внутренние единицы модели численно равны миллиметрам, поэтому
-    #  возвращаемые значения — это УЖЕ миллиметры (в JS они НЕ множатся
-    #  на 25.4, используется mmRaw()).
-    # =====================================================================
-
     def self.local_bounds(entity)
       return nil unless entity.is_a?(Sketchup::Group) ||
                         entity.is_a?(Sketchup::ComponentInstance)
+
       pts = []
-      ents = entity.is_a?(Sketchup::Group) ?
-             entity.entities : entity.definition.entities
+      ents = entity.is_a?(Sketchup::Group) ? entity.entities : entity.definition.entities
       ents.each { |e| collect_points(e, Geom::Transformation.new, pts) }
+
       b = bounds_of(pts)
       return nil unless b
+
       min, max = b
       [max[0] - min[0], max[1] - min[1], max[2] - min[2]]
     rescue => e
@@ -83,73 +85,264 @@ module DimViewer
       nil
     end
 
-    # =====================================================================
-    #  ПРОВЕРКА ПОВОРОТА
-    # =====================================================================
+    def self.local_box(entity)
+      return nil unless entity.is_a?(Sketchup::Group) ||
+                        entity.is_a?(Sketchup::ComponentInstance)
+
+      pts = []
+      ents = entity.is_a?(Sketchup::Group) ? entity.entities : entity.definition.entities
+      ents.each { |e| collect_points(e, Geom::Transformation.new, pts) }
+
+      bounds_of(pts)
+    rescue => e
+      puts "DimViewer local_box error: #{e.message}"
+      nil
+    end
 
     def self.rotated?(entity)
       return false unless entity.is_a?(Sketchup::Group) ||
                           entity.is_a?(Sketchup::ComponentInstance)
+
       t = entity.transformation
+
       xa = t.xaxis.normalize
       ya = t.yaxis.normalize
       za = t.zaxis.normalize
+
       tol = 0.9999
+
       (xa % X_AXIS).abs < tol ||
-      (ya % Y_AXIS).abs < tol ||
-      (za % Z_AXIS).abs < tol
+        (ya % Y_AXIS).abs < tol ||
+        (za % Z_AXIS).abs < tol
     rescue => e
       puts "DimViewer rotated? error: #{e.message}"
       false
     end
 
-    # =====================================================================
-    #  ОБЪЁМ И ПЛОЩАДЬ (Float, дюйм³ / дюйм²)
-    # =====================================================================
+    def self.parse_arithmetic(str)
+      s = str.to_s.strip.tr(',', '.')
+      return nil if s.empty?
+      return nil unless s =~ /\A[\d\s\.\+\-\*\/$\)]+\z/
+
+      tokens = s.scan(/\d+\.?\d*|[\+\-\*\/\($]/)
+      return nil if tokens.empty?
+
+      pos = 0
+      read_expr = nil
+      read_term = nil
+      read_factor = nil
+
+      read_factor = lambda do
+        t = tokens[pos]
+
+        if t == '('
+          pos += 1
+          v = read_expr.call
+          pos += 1 if tokens[pos] == ')'
+          v
+        elsif t == '-'
+          pos += 1
+          -read_factor.call
+        elsif t == '+'
+          pos += 1
+          read_factor.call
+        else
+          pos += 1
+          t.to_f
+        end
+      end
+
+      read_term = lambda do
+        v = read_factor.call
+
+        while tokens[pos] == '*' || tokens[pos] == '/'
+          op = tokens[pos]
+          pos += 1
+
+          r = read_factor.call
+
+          v =
+            if op == '*'
+              v * r
+            else
+              r.abs < 1e-12 ? v : v / r
+            end
+        end
+
+        v
+      end
+
+      read_expr = lambda do
+        v = read_term.call
+
+        while tokens[pos] == '+' || tokens[pos] == '-'
+          op = tokens[pos]
+          pos += 1
+
+          r = read_term.call
+          v = op == '+' ? v + r : v - r
+        end
+
+        v
+      end
+
+      result = read_expr.call
+      result.is_a?(Numeric) && result.finite? ? result : nil
+    rescue
+      nil
+    end
+
+    def self.apply_scale(axis_key, target_mm)
+      model = Sketchup.active_model
+      sel = model.selection
+
+      return unless sel.length == 1
+
+      entity = sel.first
+
+      return unless entity.is_a?(Sketchup::Group) ||
+                    entity.is_a?(Sketchup::ComponentInstance)
+
+      return if target_mm.nil? || target_mm <= 0
+
+      box = local_box(entity)
+      return unless box
+
+      min, max = box
+
+      axis_i = {
+        'x' => 0,
+        'y' => 1,
+        'z' => 2
+      }[axis_key]
+
+      return unless axis_i
+
+      t = entity.transformation
+      axis_vec = [t.xaxis, t.yaxis, t.zaxis][axis_i].normalize
+
+      corners = [
+        [min[0], min[1], min[2]],
+        [max[0], min[1], min[2]],
+        [min[0], max[1], min[2]],
+        [max[0], max[1], min[2]],
+        [min[0], min[1], max[2]],
+        [max[0], min[1], max[2]],
+        [min[0], max[1], max[2]],
+        [max[0], max[1], max[2]]
+      ].map { |c| Geom::Point3d.new(*c).transform(t) }
+
+      projs = corners.map do |p|
+        p.x * axis_vec.x + p.y * axis_vec.y + p.z * axis_vec.z
+      end
+
+      current_in = projs.max - projs.min
+      return if current_in < 1e-9
+
+      target_in = target_mm / 25.4
+      factor = target_in / current_in
+
+      return if (factor - 1.0).abs < 1e-6
+
+      sx = axis_i == 0 ? factor : 1.0
+      sy = axis_i == 1 ? factor : 1.0
+      sz = axis_i == 2 ? factor : 1.0
+
+      scale_t = Geom::Transformation.scaling(ORIGIN, sx, sy, sz)
+
+      model.start_operation('Задать размер по оси', true)
+      entity.transformation = entity.transformation * scale_t
+      model.commit_operation
+
+      update
+    rescue => e
+      puts "DimViewer apply_scale error: #{e.message}"
+
+      begin
+        model.abort_operation
+      rescue
+      end
+    end
 
     def self.calc_volume_area(entity, transform)
-      volume = 0.0; area = 0.0
+      volume = 0.0
+      area = 0.0
+
       return [0.0, 0.0] unless entity && entity.valid?
+
       case entity
       when Sketchup::Group
         t = transform * entity.transformation
-        entity.entities.each { |e| v,a = calc_volume_area(e,t); volume+=v; area+=a }
+
+        entity.entities.each do |e|
+          v, a = calc_volume_area(e, t)
+          volume += v
+          area += a
+        end
       when Sketchup::ComponentInstance
         t = transform * entity.transformation
-        entity.definition.entities.each { |e| v,a = calc_volume_area(e,t); volume+=v; area+=a }
+
+        entity.definition.entities.each do |e|
+          v, a = calc_volume_area(e, t)
+          volume += v
+          area += a
+        end
       when Sketchup::Face
         mesh = entity.mesh(0)
         pts = mesh.points.map { |p| pt_xyz(p.transform(transform)) }
+
         mesh.polygons.each do |poly|
-          p1 = pts[poly[0].abs-1]; p2 = pts[poly[1].abs-1]; p3 = pts[poly[2].abs-1]
-          ax,ay,az = p1; bx,by,bz = p2; cx,cy,cz = p3
-          ux=bx-ax; uy=by-ay; uz=bz-az
-          vx=cx-ax; vy=cy-ay; vz=cz-az
-          crx=uy*vz-uz*vy; cry=uz*vx-ux*vz; crz=ux*vy-uy*vx
-          area += Math.sqrt(crx*crx+cry*cry+crz*crz)/2.0
-          cx2=by*cz-bz*cy; cy2=bz*cx-bx*cz; cz2=bx*cy-by*cx
-          volume += (ax*cx2+ay*cy2+az*cz2)/6.0
+          p1 = pts[poly[0].abs - 1]
+          p2 = pts[poly[1].abs - 1]
+          p3 = pts[poly[2].abs - 1]
+
+          ax, ay, az = p1
+          bx, by, bz = p2
+          cx, cy, cz = p3
+
+          ux = bx - ax
+          uy = by - ay
+          uz = bz - az
+
+          vx = cx - ax
+          vy = cy - ay
+          vz = cz - az
+
+          crx = uy * vz - uz * vy
+          cry = uz * vx - ux * vz
+          crz = ux * vy - uy * vx
+
+          area += Math.sqrt(crx * crx + cry * cry + crz * crz) / 2.0
+
+          cx2 = by * cz - bz * cy
+          cy2 = bz * cx - bx * cz
+          cz2 = bx * cy - by * cx
+
+          volume += (ax * cx2 + ay * cy2 + az * cz2) / 6.0
         end
       end
+
       [volume, area]
     rescue => e
       puts "DimViewer calc_volume_area error: #{e.message}"
       [volume, area]
     end
 
-    # =====================================================================
-    #  ПЕРИМЕТР (Float, дюймы)
-    # =====================================================================
-
     def self.calc_perimeter(entity, transform)
       return 0.0 unless entity && entity.valid?
+
       length = 0.0
+
       case entity
       when Sketchup::Edge
         a = pt_xyz(entity.start.position.transform(transform))
         b = pt_xyz(entity.end.position.transform(transform))
-        dx=b[0]-a[0]; dy=b[1]-a[1]; dz=b[2]-a[2]
-        length += Math.sqrt(dx*dx+dy*dy+dz*dz)
+
+        dx = b[0] - a[0]
+        dy = b[1] - a[1]
+        dz = b[2] - a[2]
+
+        length += Math.sqrt(dx * dx + dy * dy + dz * dz)
       when Sketchup::Group
         t = transform * entity.transformation
         entity.entities.each { |e| length += calc_perimeter(e, t) }
@@ -157,81 +350,111 @@ module DimViewer
         t = transform * entity.transformation
         entity.definition.entities.each { |e| length += calc_perimeter(e, t) }
       end
+
       length
     rescue => e
       puts "DimViewer calc_perimeter error: #{e.message}"
       length
     end
 
-    # =====================================================================
-    #  КЛЮЧ ТИПА ВЫДЕЛЕНИЯ — отдаём в JS структурные данные, а НЕ строку.
-    #  Локализация происходит целиком в JS, поэтому смена языка "на лету"
-    #  не требует пересчёта геометрии.
-    # =====================================================================
-
-    def self.selection_meta(sel, count)
-      groups = comps = faces = edges = others = 0
-      sel.each do |e|
-        case e
-        when Sketchup::Group then groups += 1
-        when Sketchup::ComponentInstance then comps += 1
-        when Sketchup::Face then faces += 1
-        when Sketchup::Edge then edges += 1
-        else others += 1
-        end
-      end
-
+    def self.describe_selection(sel, count)
       if count == 1
         e = sel.first
-        case e
-        when Sketchup::Group
-          n = e.name.to_s.strip
-          return { kind: 'group',  name: n }
-        when Sketchup::ComponentInstance
-          return { kind: 'comp',   name: e.definition.name.to_s }
-        when Sketchup::Face
-          return { kind: 'face',   name: '' }
-        when Sketchup::Edge
-          return { kind: 'edge',   name: '' }
-        else
-          return { kind: 'object', name: '' }
-        end
-      end
 
-      { kind: 'multi', name: '',
-        count: count, groups: groups, comps: comps,
-        faces: faces, edges: edges, others: others }
+        if e.is_a?(Sketchup::Group)
+          n = e.name.to_s.strip
+          n.empty? ? 'Группа' : "Группа: #{n}"
+        elsif e.is_a?(Sketchup::ComponentInstance)
+          n = e.name.to_s.strip
+          dn = e.definition.name.to_s.strip
+
+          if !n.empty?
+            "Компонент: #{n}"
+          elsif !dn.empty?
+            "Компонент: #{dn}"
+          else
+            'Компонент'
+          end
+        elsif e.is_a?(Sketchup::Face)
+          'Грань'
+        elsif e.is_a?(Sketchup::Edge)
+          'Ребро'
+        else
+          e.class.name.split('::').last
+        end
+      else
+        "Выбрано объектов: #{count}"
+      end
     end
 
-    # =====================================================================
-    #  ОБНОВЛЕНИЕ ОКНА — передаём ТОЛЬКО Float + структурные данные,
-    #  БЕЗ готовых текстовых строк.
-    # =====================================================================
+    def self.send_empty
+      return unless @dialog && @dialog.visible?
+
+      @dialog.execute_script('showEmpty();') rescue nil
+    end
+
+    def self.jstr(s)
+      s.to_s
+       .gsub('\\', '\\\\')
+       .gsub("'", "\\\\'")
+       .gsub("\r", ' ')
+       .gsub("\n", ' ')
+    end
+
+    def self.js_object(hash)
+      hash.map do |k, v|
+        val =
+          case v
+          when nil
+            'null'
+          when true
+            'true'
+          when false
+            'false'
+          when Numeric
+            v.to_s
+          else
+            "'#{jstr(v)}'"
+          end
+
+        "'#{k}':#{val}"
+      end.join(',')
+    end
 
     def self.update
       return unless @dialog && @dialog.visible?
+
       begin
         model = Sketchup.active_model
         return unless model
-        sel = model.selection
 
+        sel = model.selection
         edit_t = Geom::Transformation.new
 
         if sel.empty?
           send_empty
+          refresh_preview
           return
         end
 
-        gmin = nil; gmax = nil
-        total_volume = 0.0; total_area = 0.0; total_perim = 0.0
+        gmin = nil
+        gmax = nil
+
+        total_volume = 0.0
+        total_area = 0.0
+        total_perim = 0.0
 
         sel.each do |e|
           next unless e && e.valid?
+
           wb = world_bounds(e, edit_t)
+
           if wb
             emin, emax = wb
+
             if gmin.nil?
-              gmin = emin.dup; gmax = emax.dup
+              gmin = emin.dup
+              gmax = emax.dup
             else
               3.times do |i|
                 gmin[i] = emin[i] if emin[i] < gmin[i]
@@ -239,13 +462,16 @@ module DimViewer
               end
             end
           end
+
           v, a = calc_volume_area(e, edit_t)
-          total_volume += v; total_area += a
-          total_perim  += calc_perimeter(e, edit_t)
+          total_volume += v
+          total_area += a
+          total_perim += calc_perimeter(e, edit_t)
         end
 
         if gmin.nil?
           send_empty
+          refresh_preview
           return
         end
 
@@ -254,441 +480,711 @@ module DimViewer
         dz = gmax[2] - gmin[2]
 
         count = sel.length
-        meta  = selection_meta(sel, count)
+        info = describe_selection(sel, count)
 
-        lx = ly = lz = nil
+        lx = nil
+        ly = nil
+        lz = nil
+
         if count == 1 && rotated?(sel.first)
           lb = local_bounds(sel.first)
-          if lb
-            lx, ly, lz = lb
-          end
+          lx, ly, lz = lb if lb
         end
 
-        payload = {
-          dx: dx, dy: dy, dz: dz,     # дюймы (в JS ×25.4)
-          area_in2: total_area,       # дюйм²
-          vol_in3:  total_volume,     # дюйм³
-          perim_in: total_perim,      # дюймы
-          lx: lx, ly: ly, lz: lz,     # ММ (mmRaw в JS) или null
-          meta: meta,                 # структура для локализации в JS
-          empty: false
+        scalable = count == 1 &&
+                   (sel.first.is_a?(Sketchup::Group) ||
+                    sel.first.is_a?(Sketchup::ComponentInstance))
+
+        gaps = nil
+        gaps = DimViewer::Rays.compute_gaps(sel.first) if scalable
+
+        pair = nil
+
+        if count == 2
+          a = sel[0]
+          b = sel[1]
+
+          ok = [a, b].all? do |e|
+            e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance)
+          end
+
+          pair = DimViewer::Rays.pair_gaps(a, b) if ok
+        end
+
+        dx_mm = dx * 25.4
+        dy_mm = dy * 25.4
+        dz_mm = dz * 25.4
+
+        vol_mm3 = total_volume.abs * (25.4**3)
+        area_mm2 = total_area * (25.4**2)
+        perim_mm = total_perim * 25.4
+
+        data = {
+          'info' => info,
+          'count' => count,
+          'dx' => dx_mm.round(2),
+          'dy' => dy_mm.round(2),
+          'dz' => dz_mm.round(2),
+          'lx' => lx.nil? ? nil : (lx * 25.4).round(2),
+          'ly' => ly.nil? ? nil : (ly * 25.4).round(2),
+          'lz' => lz.nil? ? nil : (lz * 25.4).round(2),
+          'volume' => vol_mm3.round(2),
+          'area' => area_mm2.round(2),
+          'perim' => perim_mm.round(2),
+          'scalable' => scalable
         }
-        send_payload(payload)
+
+        gap_js = 'null'
+
+        if gaps
+          parts = []
+
+          gaps.each do |k, v|
+            parts << "'#{k}':#{v.nil? ? 'null' : v.round(1)}"
+          end
+
+          gap_js = "{#{parts.join(',')}}"
+        end
+
+        pair_js = 'null'
+
+        if pair
+          pparts = []
+
+          pair.each do |k, v|
+            next if v.nil?
+
+            pparts << "'#{k}':#{v.round(1)}"
+          end
+
+          pair_js = "{#{pparts.join(',')}}" unless pparts.empty?
+        end
+
+        script = "showData({#{js_object(data)}}, #{gap_js}, #{pair_js});"
+
+        @dialog.execute_script(script)
+        refresh_preview
       rescue => e
         puts "DimViewer update error: #{e.message}"
-        puts e.backtrace.join("\n")
+        puts e.backtrace.join("\n") if e.backtrace
       end
     end
 
-    def self.send_empty
-      send_payload({ empty: true, meta: { kind: 'empty', name: '' } })
+    def self.preview_active?
+      DimViewer::Rays.preview_active?
     end
 
-    # JSON-сериализация: Float, целые, строки, nil, bool, Hash
-    def self.to_json_value(v)
-      case v
-      when Float
-        v.finite? ? v.to_s : 'null'
-      when Integer   then v.to_s
-      when String    then v.inspect
-      when true      then 'true'
-      when false     then 'false'
-      when nil       then 'null'
-      when Hash
-        "{" + v.map { |k, val| "#{k}:#{to_json_value(val)}" }.join(",") + "}"
-      else v.inspect
-      end
+    def self.toggle_preview
+      DimViewer::Rays.toggle_preview
     end
 
-    def self.send_payload(data)
+    def self.notify_preview_state
       return unless @dialog
-      json = "{" + data.map { |k, v| "#{k}:#{to_json_value(v)}" }.join(",") + "}"
-      @dialog.execute_script("updateDims(#{json});")
+
+      state = preview_active? ? 'true' : 'false'
+      @dialog.execute_script("setPreviewState(#{state});") rescue nil
     end
 
-    # Чтение/запись выбранного языка в настройках SketchUp
-    def self.saved_lang
-      Sketchup.read_default('DimViewer', 'lang', 'ru').to_s
+    def self.refresh_preview
+      DimViewer::Rays.refresh_preview
+    end
+
+    def self.notify_walls_state
+      return unless @dialog
+
+      @dialog.execute_script("setWallsState(#{DimViewer::Rays.walls_count});") rescue nil
+    end
+
+    def self.entity_display_name(entity)
+      return 'Объект' unless entity && entity.valid?
+
+      if entity.is_a?(Sketchup::Group)
+        name = entity.name.to_s.strip
+        name.empty? ? 'Группа' : "Группа: #{name}"
+      elsif entity.is_a?(Sketchup::ComponentInstance)
+        name = entity.name.to_s.strip
+        def_name = entity.definition.name.to_s.strip
+
+        if !name.empty?
+          "Компонент: #{name}"
+        elsif !def_name.empty?
+          "Компонент: #{def_name}"
+        else
+          'Компонент'
+        end
+      else
+        entity.class.name.split('::').last
+      end
     rescue
-      'ru'
+      'Объект'
     end
 
-    def self.save_lang(lang)
-      lang = (lang == 'en') ? 'en' : 'ru'
-      Sketchup.write_default('DimViewer', 'lang', lang)
+    def self.intersections_report_js(items)
+      items ||= []
+
+      rows = items.map do |item|
+        first = item[:first] || item['first']
+        second = item[:second] || item['second']
+        volume = item[:volume] || item['volume']
+
+        mode =
+          if volume && volume.valid?
+            'Создан красный объём пересечения и overlay-контур'
+          else
+            'Пересечение найдено'
+          end
+
+        "{'a':'#{jstr(entity_display_name(first))}','b':'#{jstr(entity_display_name(second))}','mode':'#{jstr(mode)}'}"
+      end
+
+      "[#{rows.join(',')}]"
     rescue => e
-      puts "DimViewer save_lang error: #{e.message}"
+      puts "DimViewer intersections_report_js error: #{e.message}"
+      '[]'
     end
 
-    # =====================================================================
-    #  HTML  (перевод единиц И интерфейса выполняется ЗДЕСЬ, в JS)
-    # =====================================================================
+    def self.check_intersections
+      result = DimViewer::Intersections.run
+      send_intersections_report(result)
+      result
+    rescue => e
+      puts "DimViewer check_intersections error: #{e.message}"
+      send_intersections_report([])
+      []
+    end
+
+    def self.clear_intersections
+      DimViewer::Intersections.clear_highlight
+      send_intersections_report([])
+    rescue => e
+      puts "DimViewer clear_intersections error: #{e.message}"
+    end
+
+    def self.send_intersections_report(items = [])
+      return unless @dialog && @dialog.visible?
+
+      js = intersections_report_js(items)
+      @dialog.execute_script("showIntersections(#{js});") rescue nil
+    rescue => e
+      puts "DimViewer send_intersections_report error: #{e.message}"
+    end
 
     def self.html_content
-      lang = saved_lang
-      <<-HTML
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="utf-8">
-        <style>
-          body { font-family:'Segoe UI',Tahoma,sans-serif; margin:0; padding:12px;
-                 background:#2b2b2b; color:#e0e0e0; user-select:none; }
-          .info { font-size:12px; color:#aaa; margin-bottom:12px; padding-bottom:8px;
-                  border-bottom:1px solid #444; white-space:nowrap; overflow:hidden;
-                  text-overflow:ellipsis; }
-          .row { display:flex; align-items:center; margin:6px 0; font-size:16px; }
-          .axis { width:28px; font-weight:bold; text-align:center; border-radius:4px;
-                  margin-right:10px; padding:2px 0; color:#fff; }
-          .x { background:#e74c3c; } .y { background:#2ecc71; } .z { background:#3498db; }
-          .val { font-family:'Consolas',monospace; }
-          .section { margin-top:12px; padding-top:10px; border-top:1px solid #444; }
-          .section .row { font-size:14px; }
-          .label { width:120px; color:#f1c40f; margin-right:10px; }
-          .label.vol { color:#9b59b6; } .label.per { color:#1abc9c; }
-          .label.local { color:#e67e22; }
-          .btn { margin-top:14px; width:100%; padding:8px; background:#3a3a3a;
-                 color:#e0e0e0; border:1px solid #555; border-radius:5px;
-                 cursor:pointer; font-size:13px; }
-          .btn:hover { background:#4a4a4a; }
-          .btn.copied { background:#27ae60; border-color:#27ae60; }
+      <<~'DIMVIEWER_HTML'
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #2b2b2b; color: #e0e0e0; padding: 12px; font-size: 13px; }
+  .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid #444; }
+  .title { font-size: 15px; font-weight: 600; color: #fff; }
+  .ver { font-size: 11px; color: #888; }
+  .info { background: #333; border-radius: 6px; padding: 8px 10px; margin-bottom: 10px; font-size: 12px; color: #bbb; word-break: break-word; }
+  .section { margin-bottom: 12px; }
+  .postitle { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: #888; margin-bottom: 6px; }
+  .row { display: flex; align-items: center; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid #383838; }
+  .row:last-child { border-bottom: none; }
+  .lbl { color: #aaa; }
+  .val { font-weight: 600; color: #fff; font-family: 'Consolas', monospace; }
+  .val.x { color: #e74c3c; }
+  .val.y { color: #2ecc71; }
+  .val.z { color: #3498db; }
+  .card { background: #333; border-radius: 6px; padding: 8px 12px; }
+  .inrow { display: flex; align-items: center; gap: 6px; padding: 5px 0; }
+  .inrow .tag { width: 20px; font-weight: 700; font-family: monospace; }
+  .inrow .tag.x { color: #e74c3c; }
+  .inrow .tag.y { color: #2ecc71; }
+  .inrow .tag.z { color: #3498db; }
+  input.gin, input.sin { flex: 1; background: #222; border: 1px solid #555; color: #fff; border-radius: 4px; padding: 4px 6px; font-family: monospace; font-size: 13px; }
+  input.gin:focus, input.sin:focus { outline: none; border-color: #f1c40f; }
+  .unit { color: #888; width: 26px; }
+  .ghint { font-size: 11px; color: #888; margin-top: 6px; line-height: 1.4; }
+  .ghint code { background: #222; padding: 1px 4px; border-radius: 3px; color: #f1c40f; }
+  .btn { width: 100%; background: #3a3a3a; border: 1px solid #555; color: #eee; border-radius: 5px; padding: 8px; cursor: pointer; font-size: 13px; }
+  .btn:hover { background: #454545; }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.active { background: #f1c40f; color: #222; border-color: #f1c40f; font-weight: 600; }
+  .empty { text-align: center; color: #777; padding: 30px 10px; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <div class="title">Dimensions Viewer</div>
+    <div class="ver">23</div>
+  </div>
 
-          /* верхняя панель: язык слева, версия справа */
-          .topbar { position:fixed; top:6px; right:10px; display:flex;
-                    align-items:center; gap:6px; z-index:100; }
-          .lang { display:flex; gap:3px; }
-          .lang button { font-size:10px; padding:2px 6px; border-radius:4px;
-                         border:1px solid #555; background:#333; color:#888;
-                         cursor:pointer; transition:all .15s; line-height:1; }
-          .lang button:hover { color:#e0e0e0; background:#444; }
-          .lang button.active { background:#3498db; border-color:#3498db;
-                                color:#fff; font-weight:bold; }
-          .ver { font-size:10px; color:#666; text-decoration:none;
-                 padding:2px 6px; border-radius:4px; transition:all .15s; }
-          .ver:hover { color:#3498db; background:#333; }
-        </style>
-      </head>
-      <body>
-        <div class="topbar">
-          <div class="lang">
-            <button id="btnRu" onclick="setLang('ru')">RU</button>
-            <button id="btnEn" onclick="setLang('en')">EN</button>
-          </div>
-          <a class="ver" id="verLink" href="#">v#{VERSION}</a>
-        </div>
+  <div id="content">
+    <div class="empty">Выберите объект в модели</div>
+  </div>
 
-        <div class="info" id="info" title=""></div>
-        <div class="row"><span class="axis x">X</span><span class="val" id="vx">—</span></div>
-        <div class="row"><span class="axis y">Y</span><span class="val" id="vy">—</span></div>
-        <div class="row"><span class="axis z">Z</span><span class="val" id="vz">—</span></div>
-        <div class="section">
-          <div class="row"><span class="label local" id="lbLocal"></span><span class="val" id="vlocal">—</span></div>
-          <div class="row"><span class="label" id="lbArea"></span><span class="val" id="varea">—</span></div>
-          <div class="row"><span class="label vol" id="lbVol"></span><span class="val" id="vvol">—</span></div>
-          <div class="row"><span class="label per" id="lbPer"></span><span class="val" id="vperim">—</span></div>
-        </div>
-        <button class="btn" id="copyBtn" onclick="copyAll()"></button>
+  <script>
+    var lastGaps = null;
+    var lastIntersectionsRows = null;
+    var previewActive = false;
+    var wallsCount = 0;
 
-        <script>
-          // === КОНСТАНТЫ ПЕРЕВОДА (единственное место!) ===
-          var MM_PER_INCH = 25.4;
-          var M_PER_INCH  = 0.0254;
+    function calcExpr(str) {
+      if (str === null || str === undefined) return NaN;
 
-          // === СЛОВАРИ ЛОКАЛИЗАЦИИ ===
-          var I18N = {
-            ru: {
-              mm:'мм', m2:'м²', m3:'м³',
-              local:'Локальн. (XYZ)', area:'Площадь', vol:'Объём', per:'Периметр',
-              copy:'📋 Копировать', copied:'✓ Скопировано',
-              nothing:'Ничего не выделено',
-              verTitle:'Открыть репозиторий проекта',
-              group:'Группа', groupNamed:function(n){return 'Группа: '+n;},
-              comp:function(n){return 'Компонент: '+n;},
-              face:'Грань', edge:'Ребро', object:'Объект',
-              units:{g:'гр.',c:'комп.',f:'гран.',e:'рёб.',o:'проч.'},
-              lblCopyLocal:'Локальные (XYZ)', lblCopyArea:'Площадь',
-              lblCopyVol:'Объём', lblCopyPer:'Периметр'
-            },
-            en: {
-              mm:'mm', m2:'m²', m3:'m³',
-              local:'Local (XYZ)', area:'Area', vol:'Volume', per:'Perimeter',
-              copy:'📋 Copy', copied:'✓ Copied',
-              nothing:'Nothing selected',
-              verTitle:'Open project repository',
-              group:'Group', groupNamed:function(n){return 'Group: '+n;},
-              comp:function(n){return 'Component: '+n;},
-              face:'Face', edge:'Edge', object:'Object',
-              units:{g:'grp.',c:'comp.',f:'face.',e:'edge.',o:'other.'},
-              lblCopyLocal:'Local (XYZ)', lblCopyArea:'Area',
-              lblCopyVol:'Volume', lblCopyPer:'Perimeter'
+      var s = ('' + str).trim().replace(/,/g, '.');
+
+      if (s === '') return NaN;
+      if (!/^[0-9\s\.\+\-\*\/\(\)]+$/.test(s)) return NaN;
+
+      try {
+        var v = Function('"use strict";return (' + s + ')')();
+        return (typeof v === 'number' && isFinite(v)) ? v : NaN;
+      } catch (e) {
+        return NaN;
+      }
+    }
+
+    function fmt(v) {
+      if (v === null || v === undefined) return '—';
+      return Number(v).toFixed(1);
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
+    function showEmpty() {
+      document.getElementById('content').innerHTML =
+        '<div class="empty">Выберите объект в модели</div>';
+    }
+
+    function scaleRow(axis, tag, val) {
+      return '<div class="inrow"><span class="tag ' + axis + '">' + tag + '</span>' +
+             '<input class="sin" data-axis="' + axis + '" value="' + fmt(val) + '">' +
+             '<span class="unit">мм</span></div>';
+    }
+
+    function gapRow(dir, tag, val) {
+      var disp = (val === null || val === undefined) ? '' : Number(val).toFixed(1);
+      var ph = (val === null || val === undefined) ? 'нет преграды' : '';
+
+      return '<div class="inrow"><span class="tag">' + tag + '</span>' +
+             '<input class="gin" data-dir="' + dir + '" value="' + disp + '" placeholder="' + ph + '">' +
+             '<span class="unit">мм</span></div>';
+    }
+
+    function showData(d, gaps, pair) {
+      lastGaps = gaps;
+
+      var html = '';
+
+      html += '<div class="info">' + escapeHtml(d.info) + '</div>';
+
+      html += '<div class="section"><div class="postitle">Габариты (мм)</div><div class="card">';
+      html += '<div class="row"><span class="lbl">Ширина X</span><span class="val x">' + fmt(d.dx) + '</span></div>';
+      html += '<div class="row"><span class="lbl">Глубина Y</span><span class="val y">' + fmt(d.dy) + '</span></div>';
+      html += '<div class="row"><span class="lbl">Высота Z</span><span class="val z">' + fmt(d.dz) + '</span></div>';
+      html += '</div></div>';
+
+      if (d.lx !== null && d.lx !== undefined) {
+        html += '<div class="section"><div class="postitle">Собственные размеры (мм)</div><div class="card">';
+        html += '<div class="row"><span class="lbl">Локальный X</span><span class="val x">' + fmt(d.lx) + '</span></div>';
+        html += '<div class="row"><span class="lbl">Локальный Y</span><span class="val y">' + fmt(d.ly) + '</span></div>';
+        html += '<div class="row"><span class="lbl">Локальный Z</span><span class="val z">' + fmt(d.lz) + '</span></div>';
+        html += '</div></div>';
+      }
+
+      html += '<div class="section"><div class="postitle">Свойства</div><div class="card">';
+      html += '<div class="row"><span class="lbl">Объём</span><span class="val">' + (d.volume / 1e9).toFixed(4) + ' м³</span></div>';
+      html += '<div class="row"><span class="lbl">Площадь</span><span class="val">' + (d.area / 1e6).toFixed(4) + ' м²</span></div>';
+      html += '<div class="row"><span class="lbl">Периметр</span><span class="val">' + fmt(d.perim) + ' мм</span></div>';
+      html += '</div></div>';
+
+      if (pair) {
+        html += '<div class="section"><div class="postitle">Расстояние между объектами (мм)</div><div class="card">';
+
+        var labels = {
+          xp: 'По X →',
+          xn: 'По X ←',
+          yp: 'По Y →',
+          yn: 'По Y ←',
+          zp: 'По Z ↑',
+          zn: 'По Z ↓'
+        };
+
+        var any = false;
+
+        ['xp', 'xn', 'yp', 'yn', 'zp', 'zn'].forEach(function (k) {
+          if (pair[k] !== null && pair[k] !== undefined) {
+            any = true;
+            html += '<div class="row"><span class="lbl">' + labels[k] +
+                    '</span><span class="val">' + Number(pair[k]).toFixed(1) + '</span></div>';
+          }
+        });
+
+        if (!any) {
+          html += '<div class="row"><span class="lbl">Нет прямого касания по осям</span></div>';
+        }
+
+        html += '</div></div>';
+      }
+
+      if (d.scalable) {
+        html += '<div class="section"><div class="postitle">Задать размер по оси (мм)</div><div class="card">';
+        html += scaleRow('x', 'X', d.dx);
+        html += scaleRow('y', 'Y', d.dy);
+        html += scaleRow('z', 'Z', d.dz);
+        html += '</div>';
+        html += '<div class="ghint">Введите размер и нажмите Enter — объект масштабируется по оси.<br>';
+        html += 'Можно писать выражения: <code>1200-18</code>, <code>2400/2</code>.</div></div>';
+
+        if (gaps) {
+          html += '<div class="section"><div class="postitle">Зазоры до преград (мм)</div><div class="card">';
+          html += gapRow('xp', 'X+', gaps.xp);
+          html += gapRow('xn', 'X−', gaps.xn);
+          html += gapRow('yp', 'Y+', gaps.yp);
+          html += gapRow('yn', 'Y−', gaps.yn);
+          html += gapRow('zp', 'Z+', gaps.zp);
+          html += gapRow('zn', 'Z−', gaps.zn);
+          html += '</div>';
+          html += '<div class="ghint">Введите зазор и нажмите Enter — объект сдвинется до поверхности.<br>';
+          html += 'Можно писать выражения: <code>1200-18</code>, <code>600+50</code>, <code>2400/2</code>.<br>';
+          html += 'В превью можно кликать по подсвеченному лучу.</div></div>';
+        }
+      }
+
+      html += '<div class="section">';
+      html += '<button class="btn" id="previewBtn" onclick="togglePreview()">Превью лучей в 3D</button>';
+      html += '</div>';
+
+      html += '<div class="section" id="wallsSection">';
+      html += '<div class="postitle">Стены-коллизии для лучей</div>';
+      html += '<div id="wallsInfo" style="font-size:12px;color:#aaa;margin-bottom:6px;">Учитываются все объекты</div>';
+      html += '<button class="btn" id="setWallsBtn" onclick="setWalls()">Сделать выделенное стенами</button>';
+      html += '<button class="btn" id="clearWallsBtn" onclick="clearWalls()" style="margin-top:8px;">Очистить стены</button>';
+      html += '</div>';
+
+      html += '<div class="section" id="intersectionsSection">';
+      html += '<div class="postitle">Проверка пересечений</div>';
+      html += '<button class="btn" id="checkIntersectionsBtn" onclick="checkIntersections()">Проверить пересекающиеся объекты</button>';
+      html += '<button class="btn" id="clearIntersectionsBtn" onclick="clearIntersections()" style="margin-top:8px;">Очистить подсветку</button>';
+      html += '<div id="intersectionsReport" class="ghint" style="margin-top:8px;">Выберите 2 или больше групп/компонентов и нажмите проверку.</div>';
+      html += '</div>';
+
+      document.getElementById('content').innerHTML = html;
+
+      bindInputs();
+      applyPreviewState();
+      applyWallsState();
+
+      if (lastIntersectionsRows !== null) {
+        showIntersections(lastIntersectionsRows);
+      }
+    }
+
+    function bindInputs() {
+      document.querySelectorAll('.gin').forEach(function (inp) {
+        inp.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter') {
+            var v = calcExpr(this.value);
+
+            if (!isNaN(v) && v >= 0 && window.sketchup && window.sketchup.set_gap) {
+              window.sketchup.set_gap(this.getAttribute('data-dir'), this.value);
             }
-          };
 
-          var lang = '#{lang}';
-          var current = {};
-
-          function t() { return I18N[lang]; }
-
-          // мировые размеры приходят в "дюймах" SketchUp -> множим на 25.4
-          function mm(inch)  { return (inch * MM_PER_INCH).toFixed(1) + ' ' + t().mm; }
-          // локальные размеры приходят УЖЕ в миллиметрах -> НЕ множим
-          function mmRaw(v)  { return v.toFixed(1) + ' ' + t().mm; }
-
-          function m2(in2) {
-            if (in2 === null || in2 <= 1e-9) return '—';
-            return (in2 * M_PER_INCH * M_PER_INCH).toFixed(4) + ' ' + t().m2;
+            this.blur();
           }
-          function m3(in3) {
-            if (in3 === null) return '—';
-            var v = Math.abs(in3);
-            if (v <= 1e-9) return '—';
-            return (v * M_PER_INCH * M_PER_INCH * M_PER_INCH).toFixed(6) + ' ' + t().m3;
-          }
+        });
+      });
 
-          // Формирование строки описания выделения из структуры meta
-          function buildInfo(meta) {
-            if (!meta) return '';
-            var d = t();
-            switch (meta.kind) {
-              case 'empty':  return d.nothing;
-              case 'group':  return (meta.name && meta.name.length) ? d.groupNamed(meta.name) : d.group;
-              case 'comp':   return d.comp(meta.name);
-              case 'face':   return d.face;
-              case 'edge':   return d.edge;
-              case 'object': return d.object;
-              case 'multi':
-                var u = d.units, parts = [];
-                if (meta.groups > 0) parts.push(meta.groups + ' ' + u.g);
-                if (meta.comps  > 0) parts.push(meta.comps  + ' ' + u.c);
-                if (meta.faces  > 0) parts.push(meta.faces  + ' ' + u.f);
-                if (meta.edges  > 0) parts.push(meta.edges  + ' ' + u.e);
-                if (meta.others > 0) parts.push(meta.others + ' ' + u.o);
-                return meta.count + ': ' + parts.join(', ');
-            }
-            return '';
-          }
+      document.querySelectorAll('.sin').forEach(function (inp) {
+        inp.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter') {
+            var v = calcExpr(this.value);
 
-          // Перерисовать все статические подписи по текущему языку
-          function applyStaticLabels() {
-            var d = t();
-            document.getElementById('lbLocal').innerText = d.local;
-            document.getElementById('lbArea').innerText  = d.area;
-            document.getElementById('lbVol').innerText   = d.vol;
-            document.getElementById('lbPer').innerText   = d.per;
-            document.getElementById('copyBtn').innerText = d.copy;
-            document.getElementById('verLink').title     = d.verTitle;
-            // подсветка активной кнопки языка
-            document.getElementById('btnRu').classList.toggle('active', lang === 'ru');
-            document.getElementById('btnEn').classList.toggle('active', lang === 'en');
-          }
-
-          // Полная перерисовка (значения + подписи) на текущем языке
-          function render() {
-            applyStaticLabels();
-            var d = current;
-            var info = document.getElementById('info');
-
-            if (!d || d.empty) {
-              document.getElementById('vx').innerText     = '—';
-              document.getElementById('vy').innerText     = '—';
-              document.getElementById('vz').innerText     = '—';
-              document.getElementById('vvol').innerText   = '—';
-              document.getElementById('varea').innerText  = '—';
-              document.getElementById('vperim').innerText = '—';
-              document.getElementById('vlocal').innerText = '—';
-              var txt = buildInfo(d ? d.meta : {kind:'empty'});
-              info.innerText = txt; info.title = txt;
-              return;
+            if (!isNaN(v) && v > 0 && window.sketchup && window.sketchup.set_scale) {
+              window.sketchup.set_scale(this.getAttribute('data-axis'), this.value);
             }
 
-            document.getElementById('vx').innerText = mm(d.dx);
-            document.getElementById('vy').innerText = mm(d.dy);
-            document.getElementById('vz').innerText = mm(d.dz);
-            document.getElementById('varea').innerText  = m2(d.area_in2);
-            document.getElementById('vvol').innerText   = m3(d.vol_in3);
-            document.getElementById('vperim').innerText =
-              (d.perim_in && d.perim_in > 1e-9) ? mm(d.perim_in) : '—';
-
-            var local = '—';
-            if (d.lx !== null && d.ly !== null && d.lz !== null) {
-              local = mmRaw(d.lx) + ' × ' + mmRaw(d.ly) + ' × ' + mmRaw(d.lz);
-            }
-            document.getElementById('vlocal').innerText = local;
-
-            var txt = buildInfo(d.meta);
-            info.innerText = txt; info.title = txt;
+            this.blur();
           }
+        });
+      });
+    }
 
-          // Вызывается из Ruby при каждом изменении выделения
-          function updateDims(d) {
-            current = d;
-            render();
-          }
+    function togglePreview() {
+      if (window.sketchup && window.sketchup.toggle_preview) {
+        window.sketchup.toggle_preview();
+      }
+    }
 
-          // Переключение языка "на лету"
-          function setLang(l) {
-            if (l !== 'ru' && l !== 'en') l = 'ru';
-            lang = l;
-            render();  // мгновенная перерисовка без пересчёта геометрии
-            // сохраняем выбор в настройках SketchUp
-            if (window.sketchup && window.sketchup.set_lang) {
-              window.sketchup.set_lang(l);
-            }
-          }
+    function setPreviewState(state) {
+      previewActive = state;
+      applyPreviewState();
+    }
 
-          function buildText() {
-            var d = current, l = [];
-            l.push(buildInfo(d ? d.meta : {kind:'empty'}));
-            if (d && !d.empty) {
-              l.push('X: ' + mm(d.dx));
-              l.push('Y: ' + mm(d.dy));
-              l.push('Z: ' + mm(d.dz));
-              if (d.lx !== null && d.lx !== undefined)
-                l.push(t().lblCopyLocal + ': ' + mmRaw(d.lx) + ' × ' + mmRaw(d.ly) + ' × ' + mmRaw(d.lz));
-              if (m2(d.area_in2) !== '—') l.push(t().lblCopyArea + ': ' + m2(d.area_in2));
-              if (m3(d.vol_in3)  !== '—') l.push(t().lblCopyVol  + ': ' + m3(d.vol_in3));
-              if (d.perim_in && d.perim_in > 1e-9) l.push(t().lblCopyPer + ': ' + mm(d.perim_in));
-            }
-            return l.join('\\n');
-          }
+    function applyPreviewState() {
+      var b = document.getElementById('previewBtn');
+      if (!b) return;
 
-          function copyAll() {
-            var text = buildText();
-            var btn = document.getElementById('copyBtn');
-            function showCopied() {
-              btn.classList.add('copied'); btn.innerText = t().copied;
-              setTimeout(function(){ btn.classList.remove('copied'); btn.innerText = t().copy; }, 1200);
-            }
-            function fallbackCopy(tx) {
-              var ta = document.createElement('textarea');
-              ta.value = tx; document.body.appendChild(ta); ta.select();
-              try { document.execCommand('copy'); showCopied(); } catch(e) {}
-              document.body.removeChild(ta);
-            }
-            if (navigator.clipboard && navigator.clipboard.writeText) {
-              navigator.clipboard.writeText(text).then(showCopied, function(){ fallbackCopy(text); });
-            } else { fallbackCopy(text); }
-          }
+      if (previewActive) {
+        b.classList.add('active');
+        b.innerText = 'Превью активно (выключить)';
+      } else {
+        b.classList.remove('active');
+        b.innerText = 'Превью лучей в 3D';
+      }
+    }
 
-          // Клик по версии -> открыть GitHub во внешнем браузере
-          var verLink = document.getElementById('verLink');
-          if (verLink) {
-            verLink.addEventListener('click', function(e) {
-              e.preventDefault();
-              if (window.sketchup && window.sketchup.open_github) {
-                window.sketchup.open_github();
-              }
-            });
-          }
+    function setWalls() {
+      if (window.sketchup && window.sketchup.set_walls) {
+        window.sketchup.set_walls();
+      }
+    }
 
-          // первичная отрисовка подписей на сохранённом языке
-          applyStaticLabels();
-          render();
+    function clearWalls() {
+      if (window.sketchup && window.sketchup.clear_walls) {
+        window.sketchup.clear_walls();
+      }
+    }
 
-          if (window.sketchup && window.sketchup.ready) { window.sketchup.ready(); }
-        </script>
-      </body>
-      </html>
-      HTML
+    function setWallsState(count) {
+      wallsCount = count;
+      applyWallsState();
+    }
+
+    function applyWallsState() {
+      var info = document.getElementById('wallsInfo');
+      var clr = document.getElementById('clearWallsBtn');
+
+      if (!info) return;
+
+      if (wallsCount > 0) {
+        info.innerHTML = '<b style="color:#f1c40f;">Стен задано: ' + wallsCount + '</b> — лучи считаются только до них';
+
+        if (clr) {
+          clr.disabled = false;
+        }
+      } else {
+        info.innerText = 'Учитываются все объекты';
+
+        if (clr) {
+          clr.disabled = true;
+        }
+      }
+    }
+
+    function checkIntersections() {
+      var box = document.getElementById('intersectionsReport');
+
+      if (box) {
+        box.innerHTML = 'Проверка...';
+      }
+
+      if (window.sketchup && window.sketchup.check_intersections) {
+        window.sketchup.check_intersections();
+      }
+    }
+
+    function clearIntersections() {
+      if (window.sketchup && window.sketchup.clear_intersections) {
+        window.sketchup.clear_intersections();
+      }
+    }
+
+    function showIntersections(rows) {
+      var box = document.getElementById('intersectionsReport');
+
+      lastIntersectionsRows = rows || [];
+
+      if (!box) return;
+
+      if (!rows || rows.length === 0) {
+        box.innerHTML = '<span style="color:#2ecc71;">Пересечений не найдено.</span>';
+        return;
+      }
+
+      var html = '';
+
+      html += '<div style="color:#e74c3c;font-weight:600;margin-bottom:6px;">Найдено пересечений: ' + rows.length + '</div>';
+      html += '<div class="card" style="padding:6px 8px;margin-top:6px;">';
+
+      rows.forEach(function (r, i) {
+        html += '<div style="border-bottom:1px solid #444;padding:6px 0;">';
+        html += '<div><b>' + (i + 1) + '.</b> ' + escapeHtml(r.a) + '</div>';
+        html += '<div style="color:#888;">↔ ' + escapeHtml(r.b) + '</div>';
+        html += '<div style="color:#f1c40f;font-size:11px;margin-top:2px;">' + escapeHtml(r.mode) + '</div>';
+        html += '</div>';
+      });
+
+      html += '</div>';
+
+      box.innerHTML = html;
+    }
+
+    if (window.sketchup && window.sketchup.ready) {
+      window.sketchup.ready();
+    }
+  </script>
+</body>
+</html>
+DIMVIEWER_HTML
     end
-
-    # =====================================================================
-    #  НАБЛЮДАТЕЛИ
-    # =====================================================================
-
-    class SelObserver < Sketchup::SelectionObserver
-      def onSelectionBulkChange(sel); DimViewer::Main.update; end
-      def onSelectionCleared(sel);    DimViewer::Main.update; end
-      def onSelectionAdded(sel, e);   DimViewer::Main.update; end
-      def onSelectionRemoved(sel, e); DimViewer::Main.update; end
-    end
-
-    class ToolsObserver < Sketchup::ToolsObserver
-      def onActiveToolChanged(tools, tool_name, tool_id); DimViewer::Main.update; end
-    end
-
-    # Пересчёт при Undo / Redo и любом изменении геометрии
-    class ModObserver < Sketchup::ModelObserver
-      def onTransactionUndo(model);    DimViewer::Main.delayed_update; end
-      def onTransactionRedo(model);    DimViewer::Main.delayed_update; end
-      def onTransactionCommit(model);  DimViewer::Main.delayed_update; end
-    end
-
-    class AppObserver < Sketchup::AppObserver
-      def onNewModel(model);  DimViewer::Main.attach_observers(model); DimViewer::Main.update; end
-      def onOpenModel(model); DimViewer::Main.attach_observers(model); DimViewer::Main.update; end
-    end
-
-    # Отложенный вызов: после Undo геометрия может обновляться асинхронно,
-    # поэтому пересчитываем через timer, чтобы получить актуальное состояние.
-    def self.delayed_update
-      UI.start_timer(0, false) { DimViewer::Main.update }
-    rescue
-      update
-    end
-
-    # ЖЁСТКОЕ снятие всех старых наблюдателей нашего типа + переустановка
-    def self.attach_observers(model)
-      return unless model
-      ObjectSpace.each_object(SelObserver)   { |o| model.selection.remove_observer(o) rescue nil }
-      ObjectSpace.each_object(ToolsObserver) { |o| model.tools.remove_observer(o)     rescue nil }
-      ObjectSpace.each_object(ModObserver)   { |o| model.remove_observer(o)           rescue nil }
-
-      @sel_observer   = SelObserver.new
-      @tools_observer = ToolsObserver.new
-      @mod_observer   = ModObserver.new
-      model.selection.add_observer(@sel_observer)
-      model.tools.add_observer(@tools_observer)
-      model.add_observer(@mod_observer)
-    rescue => e
-      puts "DimViewer attach_observers error: #{e.message}"
-    end
-
-    # =====================================================================
-    #  ОКНО
-    # =====================================================================
 
     def self.show_dialog
       if @dialog && @dialog.visible?
         @dialog.bring_to_front
         return
       end
+
       @dialog = UI::HtmlDialog.new(
-        dialog_title:    'Dimensions / Габариты',
-        preferences_key: 'DimViewer_Dialog',
-        scrollable:      false, resizable: true,
-        width: 280, height: 380, min_width: 240, min_height: 330,
+        dialog_title: 'Dimensions Viewer',
+        preferences_key: 'com.ivanarchitect.dimensions_viewer',
+        scrollable: true,
+        resizable: true,
+        width: 340,
+        height: 680,
+        left: 200,
+        top: 150,
         style: UI::HtmlDialog::STYLE_DIALOG
       )
-      @dialog.add_action_callback('ready') { |ctx| update }
-      @dialog.add_action_callback('open_github') do |ctx|
-        UI.openURL(GITHUB_URL)
-      end
-      # смена языка "на лету" — просто сохраняем выбор, HTML перерисуется сам
-      @dialog.add_action_callback('set_lang') do |ctx, l|
-        save_lang(l)
-      end
+
       @dialog.set_html(html_content)
+
+      @dialog.add_action_callback('ready') do |_ctx|
+        update
+        notify_preview_state
+        notify_walls_state
+      end
+
+      @dialog.add_action_callback('set_gap') do |_ctx, dir_key, value|
+        v = parse_arithmetic(value)
+        DimViewer::Rays.apply_gap(dir_key.to_sym, v) if v && v >= 0
+      end
+
+      @dialog.add_action_callback('set_scale') do |_ctx, axis_key, value|
+        v = parse_arithmetic(value)
+        apply_scale(axis_key, v) if v && v > 0
+      end
+
+      @dialog.add_action_callback('toggle_preview') do |_ctx|
+        toggle_preview
+      end
+
+      @dialog.add_action_callback('set_walls') do |_ctx|
+        DimViewer::Rays.set_walls_from_selection
+        notify_walls_state
+      end
+
+      @dialog.add_action_callback('clear_walls') do |_ctx|
+        DimViewer::Rays.clear_walls
+        notify_walls_state
+      end
+
+      @dialog.add_action_callback('check_intersections') do |_ctx|
+        check_intersections
+      end
+
+      @dialog.add_action_callback('clear_intersections') do |_ctx|
+        clear_intersections
+      end
+
+      @dialog.set_on_closed do
+        @dialog = nil
+      end
+
       @dialog.show
-      update
+
+      attach_observer
     end
 
-    # =====================================================================
-    #  ИНИЦИАЛИЗАЦИЯ
-    # =====================================================================
+    class SelObserver < Sketchup::SelectionObserver
+      def onSelectionBulkChange(_sel)
+        DimViewer::Main.update
+      end
 
-    puts "DimViewer loading v#{VERSION} from #{__FILE__}"
+      def onSelectionCleared(_sel)
+        DimViewer::Main.update
+      end
+
+      def onSelectionAdded(_sel, _entity)
+        DimViewer::Main.update
+      end
+
+      def onSelectionRemoved(_sel, _entity)
+        DimViewer::Main.update
+      end
+    end
+
+    def self.attach_observer
+      model = Sketchup.active_model
+      return unless model
+
+      @sel_observer ||= SelObserver.new
+
+      model.selection.remove_observer(@sel_observer) rescue nil
+      model.selection.add_observer(@sel_observer)
+    end
 
     unless file_loaded?(__FILE__)
       menu = UI.menu('Plugins')
-      menu.add_item('Dimensions Viewer / Габариты') { show_dialog }
-      @app_observer ||= AppObserver.new
-      Sketchup.add_observer(@app_observer)
+
+      menu.add_item('Dimensions Viewer') do
+        show_dialog
+      end
+
+      menu.add_item('Dimensions Viewer: Проверить пересечения') do
+        check_intersections
+      end
+
+      menu.add_item('Dimensions Viewer: Очистить подсветку пересечений') do
+        clear_intersections
+      end
+
+      tb = UI::Toolbar.new('Dimensions Viewer')
+
+      cmd = UI::Command.new('Dimensions Viewer') do
+        show_dialog
+      end
+
+      cmd.tooltip = 'Dimensions Viewer'
+      cmd.status_bar_text = 'Показать панель размеров и зазоров'
+      tb.add_item(cmd)
+
+      check_cmd = UI::Command.new('Проверить пересечения') do
+        check_intersections
+      end
+
+      check_cmd.tooltip = 'Проверить пересечения'
+      check_cmd.status_bar_text = 'Проверить пересечения выбранных групп/компонентов'
+      tb.add_item(check_cmd)
+
+      clear_cmd = UI::Command.new('Очистить пересечения') do
+        clear_intersections
+      end
+
+      clear_cmd.tooltip = 'Очистить подсветку пересечений'
+      clear_cmd.status_bar_text = 'Удалить временные красные объёмы пересечений и overlay-контур'
+      tb.add_item(clear_cmd)
+
+      tb.show
+
+      # Контекстное меню (правая кнопка мыши).
+      UI.add_context_menu_handler do |context_menu|
+        context_menu.add_item('Скрыть всё кроме выделенных объектов') do
+          DimViewer::HideOthers.hide_all_except_selected
+        end
+
+        context_menu.add_item('Показать всё') do
+          DimViewer::HideOthers.unhide_all
+        end
+      end
+
       file_loaded(__FILE__)
     end
 
-    # переустанавливаем наблюдателей при КАЖДОЙ загрузке
-    attach_observers(Sketchup.active_model)
-
-  end # module Main
-end # module DimViewer
+  end
+end
