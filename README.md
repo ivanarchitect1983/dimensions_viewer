@@ -3,7 +3,8 @@
 A SketchUp extension that displays the **dimensions, area, volume, and perimeter**
 of selected objects in real time.
 
-![Screenshot](/screenshot.png)
+![Screenshot](/{754FFA96-E4C1-446A-BEB1-087C4E077946}.png
+)
 
 ## Features
 - Bounding box dimensions along the X / Y / Z axes
